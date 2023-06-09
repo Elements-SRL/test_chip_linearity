@@ -15,8 +15,6 @@ def connect():
         er4.connect(devices[0])
         return True
     else:
-        res = er4.connect("e16 Demo")
-        print(res == er4.ErrorCode.Success)
         print("no device connected")
         return False
 
@@ -28,36 +26,25 @@ def configure():
     er4.setSamplingRate(0)
 
 
-def warmup():
-    # printo valori di resistenza iterativamente
-    go_on = True
-    rl_prec = 10_000_000
-    rl = 10_000_111
-    c = 0
-    while go_on:
-        vpos = er4.Measurement(100, er4.UnitPfxMilli, "V")
-        vneg = er4.Measurement(-100, er4.UnitPfxMilli, "V")
-        er4.applyDacExt(vpos)
-        ipos = acquire(0)
-        er4.applyDacExt(vneg)
-        ineg = acquire(0)
-        print(str(ipos), str(ineg))
-        dv = (vpos.value - vneg.value)/1000
-        di = (ipos - ineg) / 1e9
-        rl = dv/di if di != 0 else 0
-        print(str(di), str(abs(rl - rl_prec)), rl)
-        if abs(rl - rl_prec) > 50_000:
-            c += 1
-            go_on = c < 5
-        else:
-            rl_prec = rl
-            c = 0
-        time.sleep(3)
-    return rl
+def find_resistence(ch_idx, rl_prev=10_000_000, c=0):
+    if c > 5:
+        return rl_prev
+    # time.sleep(3)
+    vpos = er4.Measurement(100, er4.UnitPfxMilli, "V")
+    vneg = er4.Measurement(-100, er4.UnitPfxMilli, "V")
+    er4.applyDacExt(vpos)
+    ipos = acquire(ch_idx)
+    er4.applyDacExt(vneg)
+    ineg = acquire(ch_idx)
+    dv = (vpos.value - vneg.value) / 1000
+    di = (ipos - ineg) / 1e9
+    rl = dv / di if di != 0 else 0
+    return find_resistence(ch_idx, rl_prev, c+1) if abs(rl - rl_prev) < 500_000 else find_resistence(ch_idx, rl, 0)
 
 
 # Value of current in nA
 def acquire(ch_idx):
+    time.sleep(0.2)
     er4.purgeData()
     data = []
     while len(data) < 1250:
@@ -75,11 +62,7 @@ def acquire(ch_idx):
 
 def get_next_v_dac_ext(v, di, r):
     s = 1 if di > 0 else -1
-    if abs(di*r) > eps:
-        print("v + di * r")
-    else:
-        print("v + eps * s")
-    return (v + di * r) if abs(di * r) > eps else (v + eps * s)
+    return (v - di * r) if abs(di * r) > eps else (v - eps * s)
 
 
 def converge(v, r, ch_idx, c=0):
@@ -89,32 +72,40 @@ def converge(v, r, ch_idx, c=0):
     I = acquire(ch_idx)/1e9
     di = I - I0
     next_value = get_next_v_dac_ext(v_dac_ext_measurement.value, di, r)
-    print("difference with sign " + str(I-I0), "difference (abs) " + str(di - Ith), "next dac value " + str(next_value))
-    return v if (di < Ith or c > 500) else converge(next_value, r, ch_idx, c + 1)
+    return v if (abs(di) < Ith or c > 500) else converge(next_value, r, ch_idx, c + 1)
+
+
+def find_vf_dac_ext(ch_idx, r, initial_v_dac_in_measurement, initial_v_dac_in_value):
+    er4.setVoltageOffset(ch_idx, initial_v_dac_in_measurement)
+    v_dac_ext_value = initial_v_dac_in_value + r * I0
+    return converge(v_dac_ext_value, r, ch_idx)
 
 
 if __name__ == '__main__':
-    csv_rows = [["V Dac internal", "V Dac External"]]
+    csv_resistors_rows = [["R0", "R1", "R2", "R3", "R4", "R8", "R10", "R11", "R12", "R13", "R14"]]
+    csv_rows = [["VD_i ", "VD_e0", "VD_e1", "VD_e2", "VD_e3", "VD_e4",
+                 "VD_e8", "VD_e10", "VD_e11", "VD_e12", "VD_e13", "VD_e14"]]
     # Current
-    I0 = -10e-9
+    I0 = 10e-9
     # Current threshold
     Ith = 0.0122e-9
     if not connect():
         sys.exit(0)
     configure()
-    rl = warmup()
-    print("rl is " + str(rl))
-    time.sleep(5)
+    # channel_indexes = [i for i in range(16)]
+    channel_indexes = [0, 1, 2, 3, 4, 8, 10, 11, 12, 13, 14]
+    rls = [find_resistence(c) for c in channel_indexes]
+    print(str(rls))
+    csv_resistors_rows.append(rls)
+    with open('ResistorsLog.csv', 'w', newline='') as csvfile:
+        resistors_csv = csv.writer(csvfile, delimiter=',')
+        resistors_csv.writerows(csv_resistors_rows)
     for v_dac_in_mV in range(-500, 501):
         print("V Dac in is " + str(v_dac_in_mV))
         v_dac_in_value = v_dac_in_mV / 1000
         v_dac_in_measurement = er4.Measurement(v_dac_in_value, er4.UnitPfxNone, "V")
-        # (from 0 to 15)
-        for chIdx in range(1):
-            er4.setVoltageOffset(chIdx, v_dac_in_measurement)
-            v_dac_ext_value = v_dac_in_value + rl * I0
-            vf = converge(v_dac_ext_value, rl, chIdx)
-            csv_rows.append([v_dac_in_value, vf])
+        vfs = [find_vf_dac_ext(c, rls[channel_indexes.index(c)], v_dac_in_measurement, v_dac_in_value) for c in channel_indexes]
+        csv_rows.append([v_dac_in_value]+vfs)
     er4.disconnect()
     er4.deinit()
     with open('LinearityLog.csv', 'w', newline='') as csvfile:
